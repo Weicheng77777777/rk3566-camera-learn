@@ -1,0 +1,1168 @@
+### **好，就定 4.9：先跑通官方系统，再替换 Ubuntu 22.04 rootfs，这是最稳路线**
+
+你现在不要再纠结 4.19/6.1。就用手上的 `tspi-linux-4.9` 做第一阶段主线：先完整编译并烧录官方 Buildroot/Debian，确认 SDK、U-Boot、Kernel、DTS、分区、烧录链路都正常；然后制作 Ubuntu 22.04 arm64 最小 rootfs，替换 `rootfs.img`，打包烧录到 eMMC；最后把 SD 卡挂载为 `/data`，为后续 OpenCV、YOLO、RKNN、驱动开发做准备。
+
+下面我按“你真的坐在终端前一步步敲”的方式带你走。
+
+---
+
+## **阶段 0：先明确我们的最终目标**
+
+你的最终板端架构是：
+
+```text
+泰山派 RK3566
+├── eMMC
+│   ├── loader / uboot
+│   ├── boot.img：kernel 4.9 + dtb
+│   └── rootfs.img：Ubuntu 22.04 CLI Minimal
+│
+└── SD 卡
+    └── /data：源码、模型、数据集、Python 虚拟环境、编译目录
+```
+
+学习路线是：
+
+```text
+先跑通官方 SDK
+    ↓
+先烧录官方 Buildroot / Debian
+    ↓
+确认串口、网口、eMMC、USB、显示能跑
+    ↓
+制作 Ubuntu 22.04 rootfs
+    ↓
+替换 rootfs.img
+    ↓
+重新打包 update.img
+    ↓
+烧录到 eMMC
+    ↓
+板上配置 SD 卡 /data
+    ↓
+开始 OpenCV / YOLO / 驱动开发
+```
+
+你现在的原则是：**不先魔改，不先上 Ubuntu，不先搞视觉。先把官方链路跑通。**
+
+---
+
+## **阶段 1：确认 SDK 状态**
+
+进入你的 SDK 根目录：
+
+```bash
+cd ~/tspi-linux-4.9
+pwd
+ls
+```
+
+你已经看到：
+
+```text
+build.sh
+mkfirmware.sh
+kernel
+u-boot
+device
+rkbin
+prebuilts
+buildroot
+debian
+tools
+```
+
+这个目录是对的。
+
+先给脚本加执行权限：
+
+```bash
+chmod +x build.sh mkfirmware.sh rkflash.sh envsetup.sh
+```
+
+确认内核版本：
+
+```bash
+make -C kernel kernelversion
+```
+
+你大概率会看到：
+
+```text
+4.9.xxx
+```
+
+然后找泰山派相关配置：
+
+```bash
+find device -name "*tspi*" -o -name "*taishan*" -o -name "*rk3566*" | head -n 100
+```
+
+再找 DTS：
+
+```bash
+find kernel/arch/arm64/boot/dts -name "*tspi*" -o -name "*taishan*" -o -name "*rk3566*" | head -n 100
+```
+
+再看 `build.sh` 支持的板级配置：
+
+```bash
+./build.sh lunch
+```
+
+你要找类似：
+
+```text
+BoardConfig-rk3566-tspi-v10.mk
+rk3566_tspi
+taishan
+tspi
+```
+
+如果弹出选择菜单，优先选泰山派 RK3566 对应项。
+
+选完后，建议立刻记录当前配置：
+
+```bash
+cat device/rockchip/rk356x/BoardConfig-rk3566-tspi-v10.mk 2>/dev/null || true
+```
+
+如果文件名不一样，用这个找：
+
+```bash
+find device -name "BoardConfig*"
+```
+
+---
+
+## **阶段 2：安装宿主机编译依赖**
+
+你现在的主机名叫 `MacBook-R15`，但从终端看你是在 Linux 环境里。如果这是 Ubuntu 虚拟机、Ubuntu 实体机或 WSL2，都可以继续；但 **最推荐 Ubuntu 22.04 虚拟机或实体机**。如果是在 macOS 原生终端，不行，Rockchip SDK 不能直接在 macOS 上编译。
+
+先确认系统：
+
+```bash
+cat /etc/os-release
+uname -a
+```
+
+安装依赖：
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git ssh make gcc g++ \
+  libssl-dev liblz4-tool expect \
+  patchelf chrpath gawk texinfo diffstat \
+  binfmt-support qemu-user-static \
+  live-build bison flex fakeroot cmake \
+  gcc-multilib g++-multilib \
+  unzip device-tree-compiler ncurses-dev \
+  bc rsync python3 python3-pip python3-setuptools \
+  debootstrap dosfstools e2fsprogs parted \
+  whiptail vim tree wget curl file cpio \
+  libncurses5-dev libncursesw5-dev \
+  python-is-python3
+```
+
+如果你的 Ubuntu 没有 Python2，而 SDK 某些老脚本需要 Python2，可以先不装，等报错再处理。不要提前乱改。
+
+建议加 swap：
+
+```bash
+free -h
+```
+
+如果内存小于 16GB，开 16GB swap：
+
+```bash
+sudo swapoff /swapfile 2>/dev/null || true
+sudo fallocate -l 16G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+free -h
+```
+
+永久生效：
+
+```bash
+grep -q "/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" | sudo tee -a /etc/fstab
+```
+
+---
+
+## **阶段 3：先完整编译官方 Buildroot**
+
+这一步是“验机”。你先不要碰 Ubuntu 22.04。
+
+回到 SDK：
+
+```bash
+cd ~/tspi-linux-4.9
+```
+
+选择板级配置：
+
+```bash
+./build.sh lunch
+```
+
+选择泰山派 RK3566 对应配置。
+
+然后设置官方 Buildroot：
+
+```bash
+export RK_ROOTFS_SYSTEM=buildroot
+```
+
+开始全编译：
+
+```bash
+./build.sh all
+```
+
+这个过程可能很久。正常会编译：
+
+```text
+u-boot
+kernel
+buildroot rootfs
+recovery
+firmware
+```
+
+如果中途报错，不要急着改。先保存日志：
+
+```bash
+./build.sh all 2>&1 | tee build-all.log
+```
+
+如果编译成功，打包固件：
+
+```bash
+./mkfirmware.sh
+./build.sh updateimg
+```
+
+查看输出：
+
+```bash
+ls -lh rockdev/
+```
+
+你希望看到类似：
+
+```text
+MiniLoaderAll.bin
+parameter.txt
+uboot.img
+boot.img
+rootfs.img
+recovery.img
+update.img
+```
+
+如果有 `update.img`，说明官方完整镜像已经生成。
+
+---
+
+## **阶段 4：先烧录官方镜像到 eMMC**
+
+这一步是为了确认你的 SDK 生成物真的能启动。
+
+### **方式 A：Windows + RKDevTool**
+
+如果你用 Windows 烧录，一般流程是：
+
+```text
+1. 打开 RKDevTool
+2. 板子断电
+3. 按住 REC
+4. 点按 RST 或重新上电
+5. 工具识别 LOADER 设备
+6. 松开 REC
+7. 选择 update.img
+8. 执行升级
+```
+
+`update.img` 一般在：
+
+```bash
+~/tspi-linux-4.9/rockdev/update.img
+```
+
+你可以通过共享文件夹、Samba、U 盘拷到 Windows。
+
+### **方式 B：Linux 下烧录**
+
+你目录里有：
+
+```text
+rkflash.sh
+tools/
+```
+
+可以先看看脚本帮助：
+
+```bash
+./rkflash.sh --help
+```
+
+或者：
+
+```bash
+cat rkflash.sh | head -n 80
+```
+
+不同 SDK 的 Linux 烧录命令可能不同，所以这里先不要盲目执行。你可以先用 Windows 的 RKDevTool，成功率更高。
+
+---
+
+## **阶段 5：官方系统首次启动检查**
+
+烧录官方 Buildroot 后，用串口看启动日志。
+
+你需要准备：
+
+```text
+USB-TTL 串口模块
+波特率：通常 1500000 或 115200
+接线：GND-GND，TX-RX，RX-TX
+```
+
+Rockchip 板子常见串口波特率是 `1500000`。如果乱码，再试 `115200`。
+
+Linux 主机上可以用：
+
+```bash
+sudo apt install -y minicom
+sudo minicom -D /dev/ttyUSB0 -b 1500000
+```
+
+或者：
+
+```bash
+sudo screen /dev/ttyUSB0 1500000
+```
+
+官方系统起来后，检查：
+
+```bash
+uname -a
+cat /proc/cmdline
+df -h
+free -h
+lsblk
+ip addr
+dmesg | tail -n 100
+```
+
+这一步你要记录几个信息，后面做 Ubuntu rootfs 会用到：
+
+```bash
+uname -r
+cat /proc/cmdline
+lsblk
+mount
+```
+
+尤其是 `uname -r`，因为 Ubuntu rootfs 里必须放对应的内核模块目录：
+
+```text
+/lib/modules/你的内核版本/
+```
+
+---
+
+## **阶段 6：准备制作 Ubuntu 22.04 rootfs**
+
+官方系统能启动后，回到宿主机，开始制作 Ubuntu 22.04。
+
+建议新建工作目录：
+
+```bash
+mkdir -p ~/tspi-ubuntu22-rootfs
+cd ~/tspi-ubuntu22-rootfs
+```
+
+安装制作工具：
+
+```bash
+sudo apt update
+sudo apt install -y debootstrap qemu-user-static binfmt-support
+```
+
+创建 Ubuntu 22.04 arm64 rootfs：
+
+```bash
+sudo debootstrap \
+  --arch=arm64 \
+  --foreign \
+  jammy \
+  ubuntu22-rootfs \
+  http://ports.ubuntu.com/ubuntu-ports
+```
+
+复制 QEMU：
+
+```bash
+sudo cp /usr/bin/qemu-aarch64-static ubuntu22-rootfs/usr/bin/
+```
+
+进入 chroot：
+
+```bash
+sudo chroot ubuntu22-rootfs /bin/bash
+```
+
+在 chroot 内执行第二阶段：
+
+```bash
+/debootstrap/debootstrap --second-stage
+```
+
+---
+
+## **阶段 7：配置 Ubuntu 22.04 rootfs**
+
+下面命令都在 chroot 里面执行。
+
+配置软件源：
+
+```bash
+cat > /etc/apt/sources.list <<'EOF'
+deb http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+EOF
+```
+
+更新：
+
+```bash
+apt update
+```
+
+安装基础包：
+
+```bash
+apt install -y \
+  sudo vim nano less net-tools iproute2 iputils-ping \
+  ifupdown network-manager openssh-server \
+  ca-certificates curl wget git \
+  locales tzdata \
+  udev systemd systemd-sysv \
+  kmod usbutils pciutils \
+  htop tree lsof psmisc \
+  python3 python3-pip python3-venv \
+  build-essential cmake pkg-config \
+  v4l-utils i2c-tools gpiod libgpiod-dev \
+  alsa-utils
+```
+
+配置 locale：
+
+```bash
+locale-gen en_US.UTF-8
+locale-gen zh_CN.UTF-8
+
+cat > /etc/default/locale <<'EOF'
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+EOF
+```
+
+配置时区：
+
+```bash
+ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+echo "Asia/Shanghai" > /etc/timezone
+```
+
+配置 hostname：
+
+```bash
+echo "tspi-ubuntu22" > /etc/hostname
+```
+
+配置 hosts：
+
+```bash
+cat > /etc/hosts <<'EOF'
+127.0.0.1 localhost
+127.0.1.1 tspi-ubuntu22
+
+::1 localhost ip6-localhost ip6-loopback
+EOF
+```
+
+创建用户：
+
+```bash
+useradd -m -s /bin/bash ubuntu
+passwd ubuntu
+usermod -aG sudo,video,audio,plugdev,input,dialout,adm ubuntu
+```
+
+为了开发方便，可以给 sudo 免密。初期可以这样，后续发布镜像前再改：
+
+```bash
+echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
+chmod 0440 /etc/sudoers.d/ubuntu
+```
+
+启用 SSH：
+
+```bash
+systemctl enable ssh
+```
+
+允许 SSH 密码登录：
+
+```bash
+sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+```
+
+配置 NetworkManager：
+
+```bash
+systemctl enable NetworkManager
+```
+
+创建基础 fstab：
+
+```bash
+cat > /etc/fstab <<'EOF'
+proc /proc proc defaults 0 0
+tmpfs /tmp tmpfs defaults,nosuid 0 0
+EOF
+```
+
+先不要把 SD 卡 `/data` 写进去，因为你还不知道板上 SD 卡 UUID。等 Ubuntu 首次启动后再配。
+
+清理 apt 缓存：
+
+```bash
+apt clean
+rm -rf /var/lib/apt/lists/*
+```
+
+退出 chroot：
+
+```bash
+exit
+```
+
+清理 QEMU：
+
+```bash
+sudo rm -f ubuntu22-rootfs/usr/bin/qemu-aarch64-static
+```
+
+---
+
+## **阶段 8：把 4.9 内核模块放进 Ubuntu rootfs**
+
+这是非常关键的一步。
+
+你的 `boot.img` 里有 kernel 和 dtb，但 Ubuntu rootfs 里还需要：
+
+```text
+/lib/modules/内核版本/
+```
+
+否则你启动后可能遇到：
+
+```text
+modprobe 找不到模块
+USB/WiFi/摄像头/文件系统驱动不可用
+```
+
+先在 SDK 里找已经编好的 modules：
+
+```bash
+cd ~/tspi-linux-4.9
+find . -path "*lib/modules*" -type d | head -n 20
+```
+
+如果能找到类似：
+
+```text
+./buildroot/output/target/lib/modules/4.9.xxx
+./rockdev/rootfs/lib/modules/4.9.xxx
+```
+
+就直接复制到 Ubuntu rootfs：
+
+```bash
+sudo mkdir -p ~/tspi-ubuntu22-rootfs/ubuntu22-rootfs/lib/modules
+sudo cp -a 路径中的4.9.xxx目录 ~/tspi-ubuntu22-rootfs/ubuntu22-rootfs/lib/modules/
+```
+
+举例，如果你的模块在：
+
+```text
+~/tspi-linux-4.9/buildroot/output/target/lib/modules/4.9.232
+```
+
+就执行：
+
+```bash
+sudo cp -a ~/tspi-linux-4.9/buildroot/output/target/lib/modules/4.9.232 \
+  ~/tspi-ubuntu22-rootfs/ubuntu22-rootfs/lib/modules/
+```
+
+如果找不到 modules，可以尝试让 SDK 单独安装模块。先找交叉编译器：
+
+```bash
+cd ~/tspi-linux-4.9
+find prebuilts -name "aarch64-linux-gnu-gcc" -o -name "aarch64-none-linux-gnu-gcc" | head
+```
+
+假设找到的是：
+
+```text
+prebuilts/gcc/linux-x86/aarch64/gcc-linaro-xxx/bin/aarch64-linux-gnu-gcc
+```
+
+那么交叉编译前缀是：
+
+```text
+prebuilts/gcc/linux-x86/aarch64/gcc-linaro-xxx/bin/aarch64-linux-gnu-
+```
+
+执行模块安装时类似：
+
+```bash
+cd ~/tspi-linux-4.9/kernel
+
+make ARCH=arm64 \
+  CROSS_COMPILE=../prebuilts/你的工具链路径/bin/aarch64-linux-gnu- \
+  modules_install \
+  INSTALL_MOD_PATH=~/tspi-ubuntu22-rootfs/ubuntu22-rootfs
+```
+
+但初学阶段优先用 `find . -path "*lib/modules*"` 找现成输出，别一开始就手动折腾工具链。
+
+复制 firmware。先看看官方 rootfs 里有没有：
+
+```bash
+cd ~/tspi-linux-4.9
+find . -path "*lib/firmware*" -type d | head -n 20
+```
+
+如果有，可以复制：
+
+```bash
+sudo mkdir -p ~/tspi-ubuntu22-rootfs/ubuntu22-rootfs/lib/firmware
+sudo cp -a 官方rootfs里的firmware目录内容/* \
+  ~/tspi-ubuntu22-rootfs/ubuntu22-rootfs/lib/firmware/ 2>/dev/null || true
+```
+
+---
+
+## **阶段 9：打包 Ubuntu rootfs.img**
+
+回到 rootfs 工作目录：
+
+```bash
+cd ~/tspi-ubuntu22-rootfs
+```
+
+先看 rootfs 大小：
+
+```bash
+sudo du -sh ubuntu22-rootfs
+```
+
+Ubuntu 22.04 minimal 加基础工具可能 1GB \~ 2GB。考虑 eMMC 只有 8GB，rootfs 镜像建议先做 5GB。
+
+创建 ext4 镜像：
+
+```bash
+dd if=/dev/zero of=ubuntu22-rootfs.img bs=1M count=5000
+mkfs.ext4 ubuntu22-rootfs.img
+```
+
+挂载：
+
+```bash
+mkdir -p mnt
+sudo mount ubuntu22-rootfs.img mnt
+```
+
+复制 rootfs：
+
+```bash
+sudo cp -a ubuntu22-rootfs/* mnt/
+sync
+```
+
+卸载：
+
+```bash
+sudo umount mnt
+```
+
+检查并压缩到最小：
+
+```bash
+e2fsck -p -f ubuntu22-rootfs.img
+resize2fs -M ubuntu22-rootfs.img
+```
+
+得到：
+
+```text
+~/tspi-ubuntu22-rootfs/ubuntu22-rootfs.img
+```
+
+---
+
+## **阶段 10：替换 SDK 的 rootfs.img 并重新打包**
+
+回到 SDK：
+
+```bash
+cd ~/tspi-linux-4.9
+```
+
+先备份官方 rootfs：
+
+```bash
+mkdir -p backup-images
+cp -a rockdev/rootfs.img backup-images/rootfs-buildroot.img 2>/dev/null || true
+cp -a rockdev/update.img backup-images/update-buildroot.img 2>/dev/null || true
+```
+
+替换 rootfs：
+
+```bash
+cp ~/tspi-ubuntu22-rootfs/ubuntu22-rootfs.img rockdev/rootfs.img
+```
+
+重新打包：
+
+```bash
+./mkfirmware.sh
+./build.sh updateimg
+```
+
+查看新镜像：
+
+```bash
+ls -lh rockdev/update.img rockdev/rootfs.img
+```
+
+如果 `update.img` 时间更新了，说明打包成功。
+
+---
+
+## **阶段 11：烧录 Ubuntu 22.04 到 eMMC**
+
+还是用你前面跑通过的烧录方式。
+
+如果用 RKDevTool：
+
+```text
+1. 板子进入 Loader 模式
+2. 选择新的 rockdev/update.img
+3. 执行升级
+4. 等待烧录完成
+5. 自动重启或手动重启
+```
+
+第一次启动 Ubuntu 可能比 Buildroot 慢很多。串口要一直开着看日志。
+
+---
+
+## **阶段 12：Ubuntu 首次启动后检查**
+
+登录用户：
+
+```text
+username: ubuntu
+password: 你刚才设置的密码
+```
+
+检查系统：
+
+```bash
+cat /etc/os-release
+uname -a
+uname -r
+df -h
+free -h
+lsblk
+ip addr
+```
+
+检查内核模块：
+
+```bash
+ls /lib/modules
+uname -r
+```
+
+确保：
+
+```bash
+ls /lib/modules/$(uname -r)
+```
+
+存在。
+
+执行：
+
+```bash
+sudo depmod -a
+```
+
+检查网络：
+
+```bash
+nmcli dev
+ip addr
+ping -c 4 8.8.8.8
+```
+
+如果网口没自动拿到 IP，试：
+
+```bash
+sudo dhclient eth0
+```
+
+如果提示没有 `dhclient`：
+
+```bash
+sudo apt update
+sudo apt install -y isc-dhcp-client
+sudo dhclient eth0
+```
+
+---
+
+## **阶段 13：挂载 SD 卡为 `/data`**
+
+插 SD 卡后：
+
+```bash
+lsblk
+```
+
+假设 SD 卡是 `/dev/mmcblk1`，分区是 `/dev/mmcblk1p1`。
+
+如果是新卡，可以格式化：
+
+```bash
+sudo mkfs.ext4 /dev/mmcblk1p1
+```
+
+创建挂载点：
+
+```bash
+sudo mkdir -p /data
+```
+
+查看 UUID：
+
+```bash
+sudo blkid /dev/mmcblk1p1
+```
+
+假设输出：
+
+```text
+UUID="abcd-xxxx"
+```
+
+编辑 fstab：
+
+```bash
+sudo vim /etc/fstab
+```
+
+添加：
+
+```text
+UUID=你的UUID /data ext4 defaults,noatime,nofail 0 2
+```
+
+注意这里我加了 `nofail`，这样 SD 卡没插时系统也不会卡死。
+
+测试：
+
+```bash
+sudo mount -a
+df -h
+```
+
+改权限：
+
+```bash
+sudo chown -R ubuntu:ubuntu /data
+```
+
+建立目录：
+
+```bash
+mkdir -p /data/{src,models,datasets,venvs,build,logs}
+```
+
+---
+
+## **阶段 14：配置视觉开发基础环境**
+
+现在你可以把 Python 虚拟环境放到 SD 卡：
+
+```bash
+python3 -m venv /data/venvs/vision
+source /data/venvs/vision/bin/activate
+pip install --upgrade pip setuptools wheel
+```
+
+先用 apt 安装 OpenCV，不要一开始就在板上编译 OpenCV：
+
+```bash
+sudo apt update
+sudo apt install -y python3-opencv libopencv-dev v4l-utils
+```
+
+测试 OpenCV：
+
+```bash
+python3 - <<'PY'
+import cv2
+print("OpenCV:", cv2.__version__)
+PY
+```
+
+测试摄像头：
+
+```bash
+ls /dev/video*
+v4l2-ctl --list-devices
+```
+
+Python 读取摄像头：
+
+```bash
+python3 - <<'PY'
+import cv2
+
+cap = cv2.VideoCapture(0)
+print("opened:", cap.isOpened())
+
+ret, frame = cap.read()
+print("ret:", ret)
+print("shape:", None if frame is None else frame.shape)
+
+cap.release()
+PY
+```
+
+如果能读到 frame，你的视觉基础链路就已经起来了。
+
+---
+
+## **阶段 15：后续驱动开发从哪里开始**
+
+你后面不要一上来就写复杂摄像头驱动。建议从这条线开始：
+
+```text
+GPIO 控制
+    ↓
+设备树 DTS 控制 GPIO
+    ↓
+写一个简单字符设备驱动
+    ↓
+I2C 设备驱动
+    ↓
+SPI 设备驱动
+    ↓
+V4L2 摄像头链路
+    ↓
+DRM/eDP 显示链路
+    ↓
+RKNN/NPU 推理
+```
+
+在 SDK 里，你的主战场是：
+
+```bash
+cd ~/tspi-linux-4.9
+```
+
+设备树：
+
+```bash
+find kernel/arch/arm64/boot/dts -name "*rk3566*" | head -n 50
+```
+
+驱动目录：
+
+```bash
+ls kernel/drivers/gpio
+ls kernel/drivers/i2c
+ls kernel/drivers/spi
+ls kernel/drivers/media
+ls kernel/drivers/gpu/drm
+```
+
+单独编译 kernel：
+
+```bash
+cd ~/tspi-linux-4.9
+./build.sh kernel
+./mkfirmware.sh
+```
+
+后续你改 DTS 或驱动，不需要每次重做 Ubuntu rootfs。一般只需要：
+
+```text
+改 kernel / dts
+    ↓
+./build.sh kernel
+    ↓
+./mkfirmware.sh
+    ↓
+烧录 boot.img 或重新 update.img
+```
+
+---
+
+## **阶段 16：最常见问题和处理方式**
+
+### **1. Ubuntu 卡在启动中**
+
+先看串口，不要盲猜。
+
+重点看：
+
+```text
+VFS: Cannot open root device
+Kernel panic
+Failed to mount
+systemd timeout
+```
+
+如果是 rootfs 分区问题，检查：
+
+```bash
+cat /proc/cmdline
+```
+
+官方 Buildroot 能启动时，把它的 `/proc/cmdline` 记录下来，对比 Ubuntu 的启动参数。
+
+### **2. 登录后没有网络**
+
+检查：
+
+```bash
+ip link
+nmcli dev
+dmesg | grep -i eth
+```
+
+尝试：
+
+```bash
+sudo dhclient eth0
+```
+
+如果网卡名不是 `eth0`，用 `ip link` 看到的名字替换。
+
+### **3. 没有 `/dev/video0`**
+
+检查摄像头驱动和设备树：
+
+```bash
+dmesg | grep -i camera
+dmesg | grep -i video
+dmesg | grep -i csi
+dmesg | grep -i mipi
+v4l2-ctl --list-devices
+```
+
+这通常不是 Ubuntu rootfs 的问题，而是 kernel/DTS/驱动链路问题。
+
+### **4. `modprobe` 找不到模块**
+
+检查：
+
+```bash
+uname -r
+ls /lib/modules
+```
+
+如果 `/lib/modules/$(uname -r)` 不存在，就说明你没有把 4.9 内核模块放进 Ubuntu rootfs。
+
+### **5. eMMC 空间不够**
+
+检查：
+
+```bash
+df -h
+sudo du -sh /*
+```
+
+解决思路：
+
+```text
+pip venv 放 /data
+源码放 /data
+模型放 /data
+编译目录放 /data
+apt 缓存及时清理
+```
+
+清理：
+
+```bash
+sudo apt clean
+sudo journalctl --vacuum-size=100M
+```
+
+---
+
+## **你现在立刻执行这一组命令**
+
+先别做 Ubuntu，先完成官方系统编译闭环。你现在就从这里开始：
+
+```bash
+cd ~/tspi-linux-4.9
+
+chmod +x build.sh mkfirmware.sh rkflash.sh envsetup.sh
+
+make -C kernel kernelversion
+
+find device -name "*tspi*" -o -name "*taishan*" -o -name "*rk3566*" | head -n 100
+
+find kernel/arch/arm64/boot/dts -name "*tspi*" -o -name "*taishan*" -o -name "*rk3566*" | head -n 100
+
+./build.sh lunch
+```
+
+选好泰山派 RK3566 配置后：
+
+```bash
+export RK_ROOTFS_SYSTEM=buildroot
+./build.sh all 2>&1 | tee build-all.log
+```
+
+成功后：
+
+```bash
+./mkfirmware.sh
+./build.sh updateimg
+ls -lh rockdev/
+```
+
+这一步完成，你就有了官方可启动镜像。等这个跑通，再进入 Ubuntu 22.04 rootfs 替换阶段，成功率会高很多。
+
+
+
+
+

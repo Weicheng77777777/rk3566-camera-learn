@@ -29,3 +29,8 @@ source ~/.bashrc
 # 启动时开启 Auto mode
 claude --enable-auto-mode
 ```
+
+如果你是在 Docker、临时目录、虚拟机里跑，确认没有重要文件和敏感凭证，再用：
+```bash
+claude --dangerously-skip-permissions
+```
